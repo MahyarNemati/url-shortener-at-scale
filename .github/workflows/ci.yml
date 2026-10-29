@@ -75,15 +75,6 @@ jobs:
   e2e:
     name: end to end, with ClickHouse
     runs-on: ubuntu-latest
-    services:
-      clickhouse:
-        image: clickhouse/clickhouse-server:24.8-alpine
-        ports: ['8123:8123']
-        options: >-
-          --health-cmd "wget -qO- http://localhost:8123/ping || exit 1"
-          --health-interval 5s
-          --health-timeout 3s
-          --health-retries 20
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-go@v6
@@ -91,6 +82,34 @@ jobs:
           go-version: '1.25'
           cache: true
       - run: go build -o shortener ./cmd/shortener
+
+      # ClickHouse is started with `docker run` rather than as a service
+      # container, for two reasons: it needs a raised nofile limit that a
+      # service container's `options` cannot set (it goes unhealthy without
+      # one), and running it directly means its startup log is visible when
+      # something goes wrong instead of just "failed to initialize".
+      - name: Start ClickHouse
+        run: |
+          docker run -d --name clickhouse \
+            -p 8123:8123 \
+            --ulimit nofile=262144:262144 \
+            -e CLICKHOUSE_DB=default \
+            -e CLICKHOUSE_SKIP_USER_SETUP=1 \
+            clickhouse/clickhouse-server:24.8-alpine
+
+          for i in $(seq 1 60); do
+            if curl -fsS http://localhost:8123/ping >/dev/null 2>&1; then
+              echo "clickhouse is up after ${i}s"
+              break
+            fi
+            if [ "$i" = "60" ]; then
+              echo "::error::clickhouse did not become ready"
+              docker logs clickhouse | tail -40
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -fsS "http://localhost:8123/?query=SELECT%20version()"
 
       - name: Apply the ClickHouse schema
         run: ./shortener -clickhouse http://localhost:8123 -migrate
@@ -229,9 +248,15 @@ jobs:
           echo "dropped: $dropped"
           [ "$dropped" = "0" ] || { echo "::error::dropped $dropped click events"; exit 1; }
 
-      - name: Stop the service
+      - name: ClickHouse logs on failure
+        if: failure()
+        run: docker logs clickhouse | tail -60
+
+      - name: Tear down
         if: always()
-        run: kill "$(cat shortener.pid)" 2>/dev/null || true
+        run: |
+          kill "$(cat shortener.pid)" 2>/dev/null || true
+          docker rm -f clickhouse 2>/dev/null || true
 
   k6:
     name: load test runs and the cache is exercised

@@ -65,6 +65,13 @@ export const options = {
   },
   // Following redirects would measure go.dev, not this service.
   noVUConnectionReuse: false,
+  // Bodies are discarded by default: at a few thousand requests per second
+  // the only thing that matters about a redirect is its status and Location
+  // header, and reading bodies costs real CPU in the load generator.
+  //
+  // setup() must opt back in per request, because this option applies to
+  // every request including its own -- and reading res.json() on a discarded
+  // body fails with "the body is null".
   discardResponseBodies: true,
 };
 
@@ -77,7 +84,9 @@ export function setup() {
     const res = http.post(
       `${BASE_URL}/api/v1/links`,
       JSON.stringify({ target: `https://example.com/page/${i}?utm_source=loadtest` }),
-      { headers },
+      // responseType overrides the global discardResponseBodies, which would
+      // otherwise leave res.body null and res.json() throwing.
+      { headers, responseType: 'text' },
     );
     if (res.status !== 201) {
       fail(`setup: creating link ${i} returned ${res.status}: ${res.body}`);
@@ -132,7 +141,7 @@ export default function (data) {
 // the number worth looking at: a load test that does not check the hit rate
 // cannot tell you whether it exercised the cache or just the database.
 export function teardown() {
-  const res = http.get(`${BASE_URL}/metrics`);
+  const res = http.get(`${BASE_URL}/metrics`, { responseType: 'text' });
   if (res.status !== 200) return;
 
   const wanted = [
