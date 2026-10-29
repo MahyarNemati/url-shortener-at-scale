@@ -2,6 +2,7 @@
 //
 //   k6 run k6/redirect.js
 //   k6 run -e BASE_URL=http://localhost:8080 -e TOKEN=... k6/redirect.js
+//   k6 run -e PROFILE=smoke k6/redirect.js      (the short run CI uses)
 //
 // The shape of this test matters more than the numbers. A naive load test
 // requests one slug over and over, which measures a warm cache hit and
@@ -32,29 +33,58 @@ const hotHits = new Counter('hot_hits');
 const coldHits = new Counter('cold_hits');
 const junkHits = new Counter('junk_hits');
 
+// Two profiles. `full` is the real test, run against a deployment on
+// hardware you chose. `smoke` is what CI runs: the same executor and the same
+// thresholds at a tenth of the rate, so a failure means the code regressed
+// rather than that a shared runner was busy.
+//
+// They must share the executor. Overriding the stages from the command line
+// with k6's --stage does *not* do this: --stage replaces the scenario with a
+// ramping-vus one, which turns a rate-limited arrival test into N concurrent
+// clients hammering as fast as they can. Latency then measures queueing in
+// the load generator, and a p99 threshold becomes a test of the runner.
+const PROFILE = __ENV.PROFILE || 'full';
+
+const STAGES = {
+  full: [
+    { target: 500, duration: '20s' },
+    { target: 2000, duration: '30s' },
+    { target: 2000, duration: '60s' },
+    { target: 5000, duration: '30s' },
+    { target: 5000, duration: '30s' },
+    { target: 0, duration: '10s' },
+  ],
+  smoke: [
+    { target: 300, duration: '5s' },
+    { target: 300, duration: '15s' },
+    { target: 0, duration: '5s' },
+  ],
+};
+
+if (!STAGES[PROFILE]) {
+  throw new Error(`unknown PROFILE ${PROFILE}; expected one of ${Object.keys(STAGES).join(', ')}`);
+}
+
 export const options = {
   scenarios: {
     // A ramping arrival rate, not a fixed number of VUs: it measures what the
     // service can serve, rather than how fast a fixed pool can loop.
     redirects: {
       executor: 'ramping-arrival-rate',
-      startRate: 200,
+      startRate: PROFILE === 'smoke' ? 50 : 200,
       timeUnit: '1s',
       preAllocatedVUs: 50,
-      maxVUs: 500,
-      stages: [
-        { target: 500, duration: '20s' },
-        { target: 2000, duration: '30s' },
-        { target: 2000, duration: '60s' },
-        { target: 5000, duration: '30s' },
-        { target: 5000, duration: '30s' },
-        { target: 0, duration: '10s' },
-      ],
+      maxVUs: PROFILE === 'smoke' ? 100 : 500,
+      stages: STAGES[PROFILE],
     },
   },
   thresholds: {
-    // The hot path is the product.
-    'redirect_latency{expected_response:true}': ['p(95)<20', 'p(99)<50'],
+    // The hot path is the product. Tagging by request name is the way to
+    // isolate it: a custom Trend carries only the tags set on it, so
+    // `redirect_latency{expected_response:true}` names a sub-metric with no
+    // samples at all -- which reports 0s and passes whatever the service
+    // does. A threshold that cannot fail is worse than no threshold.
+    'http_req_duration{name:redirect_hit}': ['p(95)<20', 'p(99)<50'],
     redirect_latency: ['p(99)<50'],
     // A miss still has to be fast, or a crawler degrades the service for
     // everyone.

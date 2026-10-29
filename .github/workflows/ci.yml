@@ -285,11 +285,15 @@ jobs:
 
       # A short run: the point is that the script is valid and the thresholds
       # are met, not to publish a throughput number from a shared runner.
+      #
+      # PROFILE, not --stage: --stage would replace the arrival-rate executor
+      # with ramping-vus, so 500 VUs would queue against a 2-vCPU runner and
+      # the latency thresholds would be measuring the runner.
       - name: Smoke the load test
         run: |
           k6 run --quiet \
             -e TOKEN=dev-token-at-least-16ch -e CORPUS=200 -e HOT=20 \
-            --stage 5s:200 --stage 10s:500 --stage 5s:0 \
+            -e PROFILE=smoke \
             k6/redirect.js
 
       - name: The cache was actually exercised
