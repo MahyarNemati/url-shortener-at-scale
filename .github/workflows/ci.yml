@@ -22,7 +22,7 @@ jobs:
       matrix:
         go: ['1.24', '1.25']
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: ${{ matrix.go }}
@@ -49,7 +49,7 @@ jobs:
     name: IDs are unique and slugs are not enumerable
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -65,7 +65,7 @@ jobs:
     name: benchmarks run
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -76,7 +76,7 @@ jobs:
     name: end to end, with ClickHouse
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -262,7 +262,7 @@ jobs:
     name: load test runs and the cache is exercised
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
@@ -315,7 +315,7 @@ jobs:
     name: image builds
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: docker/setup-buildx-action@v3
       - uses: docker/build-push-action@v6
         with:
@@ -329,7 +329,7 @@ jobs:
     name: go.mod is tidy
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-go@v6
         with:
           go-version: '1.25'
