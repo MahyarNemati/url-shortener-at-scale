@@ -1,0 +1,53 @@
+services:
+  shortener:
+    build: .
+    ports:
+      - "8080:8080"
+    environment:
+      SHORTENER_TOKEN: "change-me-token-at-least-16"
+      # Without this, slugs are an enumerable base62 counter.
+      SHORTENER_SLUG_SECRET: "change-me-slug-secret"
+      SHORTENER_BASE_URL: "http://localhost:8080"
+      SHORTENER_CLICKHOUSE: "http://clickhouse:8123"
+      # Each replica needs a distinct instance id, or two can mint the same
+      # ID in the same millisecond.
+      SHORTENER_INSTANCE: "0"
+      SHORTENER_LOG_FORMAT: "text"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  migrate:
+    build: .
+    command: ["-clickhouse", "http://clickhouse:8123", "-migrate"]
+    environment:
+      SHORTENER_TOKEN: "change-me-token-at-least-16"
+    depends_on:
+      clickhouse:
+        condition: service_healthy
+    restart: "no"
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:24.8-alpine
+    ports:
+      - "8123:8123"
+    environment:
+      CLICKHOUSE_DB: default
+      CLICKHOUSE_DEFAULT_ACCESS_MANAGEMENT: "1"
+    ulimits:
+      nofile:
+        soft: 262144
+        hard: 262144
+    volumes:
+      - chdata:/var/lib/clickhouse
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8123/ping || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+volumes:
+  chdata:

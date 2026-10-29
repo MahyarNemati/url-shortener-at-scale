@@ -1,0 +1,309 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: test (go ${{ matrix.go }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        go: ['1.24', '1.25']
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: ${{ matrix.go }}
+          cache: true
+
+      - name: Verify formatting
+        run: |
+          unformatted=$(gofmt -l .)
+          if [ -n "$unformatted" ]; then
+            echo "::error::gofmt needed on:"; echo "$unformatted"; exit 1
+          fi
+
+      - run: go vet ./...
+      - run: go build ./...
+
+      # ID generation and the cache are both concurrent by design, so the race
+      # detector is doing real work here.
+      - name: Test (race)
+        env:
+          CGO_ENABLED: 1   # the race detector needs cgo
+        run: go test -race -count=1 ./...
+
+  id-generation:
+    name: IDs are unique and slugs are not enumerable
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      # A duplicate ID means two links share a slug, and a non-bijective
+      # obfuscator means the same. Worth extra repetitions.
+      - name: Repeat the uniqueness and bijection tests
+        env:
+          CGO_ENABLED: 1
+        run: go test -race -count=3 -run 'Unique|Bijection|Collision|Concurren' ./internal/shortid/...
+
+  benchmarks:
+    name: benchmarks run
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go test -run '^$' -bench . -benchtime 1000x -benchmem ./internal/...
+
+  e2e:
+    name: end to end, with ClickHouse
+    runs-on: ubuntu-latest
+    services:
+      clickhouse:
+        image: clickhouse/clickhouse-server:24.8-alpine
+        ports: ['8123:8123']
+        options: >-
+          --health-cmd "wget -qO- http://localhost:8123/ping || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go build -o shortener ./cmd/shortener
+
+      - name: Apply the ClickHouse schema
+        run: ./shortener -clickhouse http://localhost:8123 -migrate
+        env:
+          SHORTENER_TOKEN: ci-token-at-least-16-chars
+
+      - name: Start the service
+        env:
+          SHORTENER_TOKEN: ci-token-at-least-16-chars
+          SHORTENER_SLUG_SECRET: ci-slug-secret
+          SHORTENER_CLICKHOUSE: http://localhost:8123
+          SHORTENER_BASE_URL: http://localhost:8080
+        run: |
+          ./shortener -addr :8080 &
+          echo $! > shortener.pid
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+          curl -fsS localhost:8080/readyz
+
+      - name: Behaviour matches the documentation
+        run: |
+          python3 - <<'PY'
+          import json, urllib.request, urllib.error, time
+
+          TOKEN = "ci-token-at-least-16-chars"
+          BASE = "http://localhost:8080"
+
+          def api(method, path, body=None):
+              data = json.dumps(body).encode() if body is not None else None
+              req = urllib.request.Request(BASE + path, data=data, method=method,
+                    headers={"Authorization": f"Bearer {TOKEN}",
+                             "Content-Type": "application/json"})
+              try:
+                  with urllib.request.urlopen(req) as r:
+                      raw = r.read()
+                      return r.status, (json.loads(raw) if raw else None)
+              except urllib.error.HTTPError as e:
+                  raw = e.read()
+                  try:
+                      return e.code, json.loads(raw)
+                  except Exception:
+                      return e.code, None
+
+          def head(path):
+              req = urllib.request.Request(BASE + path, method="GET")
+              class NoRedirect(urllib.request.HTTPRedirectHandler):
+                  def redirect_request(self, *a, **k): return None
+              opener = urllib.request.build_opener(NoRedirect)
+              try:
+                  with opener.open(req) as r:
+                      return r.status, dict(r.headers)
+              except urllib.error.HTTPError as e:
+                  return e.code, dict(e.headers)
+
+          # Create and resolve.
+          status, body = api("POST", "/api/v1/links", {"target": "https://go.dev/doc"})
+          assert status == 201, (status, body)
+          slug = body["slug"]
+          assert body["short_url"].endswith(slug), body
+
+          code, headers = head("/" + slug)
+          assert code == 302, code
+          assert headers["Location"] == "https://go.dev/doc", headers
+          assert "no-store" in headers.get("Cache-Control", ""), headers
+
+          # Dangerous schemes rejected.
+          for bad in ["javascript:alert(1)", "data:text/html,x", "file:///etc/passwd"]:
+              status, _ = api("POST", "/api/v1/links", {"target": bad})
+              assert status == 400, (bad, status)
+
+          # Slugs are not sequential: two consecutive creates must not be
+          # adjacent in base62.
+          ALPHABET = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+          def decode(s):
+              n = 0
+              for ch in s:
+                  n = n * 62 + ALPHABET.index(ch)
+              return n
+          _, a = api("POST", "/api/v1/links", {"target": "https://a.example"})
+          _, b = api("POST", "/api/v1/links", {"target": "https://b.example"})
+          da, db = decode(a["slug"]), decode(b["slug"])
+          assert abs(da - db) != 1, (a["slug"], b["slug"], "slugs are enumerable")
+
+          # Vanity slug, then delete -> 410 immediately.
+          status, _ = api("POST", "/api/v1/links",
+                          {"target": "https://example.com", "slug": "ci-vanity"})
+          assert status == 201, status
+          assert head("/ci-vanity")[0] == 302
+          status, _ = api("DELETE", "/api/v1/links/ci-vanity")
+          assert status == 204, status
+          assert head("/ci-vanity")[0] == 410, "delete must take effect despite the cache"
+
+          # Unknown slug is 404, reserved paths are not slugs.
+          assert head("/nosuchslug")[0] == 404
+          assert head("/favicon.ico")[0] != 302
+
+          # Expiry.
+          status, body = api("POST", "/api/v1/links",
+                             {"target": "https://example.com", "ttl": "1s"})
+          assert status == 201
+          time.sleep(2)
+          assert head("/" + body["slug"])[0] == 410
+
+          print("ok: every documented behaviour holds")
+          PY
+
+      - name: Clicks reach ClickHouse
+        run: |
+          # Generate traffic, then wait for the batch to flush.
+          slug=$(curl -fsS -X POST -H "Authorization: Bearer ci-token-at-least-16-chars" \
+            -H 'Content-Type: application/json' \
+            -d '{"target":"https://example.com/tracked"}' \
+            localhost:8080/api/v1/links | python3 -c 'import json,sys; print(json.load(sys.stdin)["slug"])')
+          for i in $(seq 1 25); do curl -fsS -o /dev/null localhost:8080/$slug || true; done
+          sleep 6
+
+          rows=$(curl -fsS "http://localhost:8123/?query=SELECT%20count()%20FROM%20clicks")
+          echo "clicks table has $rows row(s)"
+          [ "$rows" -ge 25 ] || { echo "::error::expected at least 25 clicks, got $rows"; exit 1; }
+
+          # The rollup materialized view must have populated too.
+          daily=$(curl -fsS "http://localhost:8123/?query=SELECT%20countMerge(clicks)%20FROM%20clicks_daily")
+          echo "clicks_daily reports $daily"
+          [ "$daily" -ge 25 ] || { echo "::error::rollup did not populate: $daily"; exit 1; }
+
+          # IPs must be truncated, never stored whole.
+          bad=$(curl -fsS "http://localhost:8123/?query=SELECT%20count()%20FROM%20clicks%20WHERE%20ip_prefix%20!=%20''%20AND%20position(ip_prefix,%20'/')%20=%200")
+          [ "$bad" = "0" ] || { echo "::error::$bad click(s) stored an untruncated IP"; exit 1; }
+          echo "ok: clicks ingested, rollup populated, IPs truncated"
+
+      - name: No clicks were dropped
+        run: |
+          dropped=$(curl -fsS localhost:8080/metrics | awk '/^shortener_clicks_dropped_total /{print $2}')
+          echo "dropped: $dropped"
+          [ "$dropped" = "0" ] || { echo "::error::dropped $dropped click events"; exit 1; }
+
+      - name: Stop the service
+        if: always()
+        run: kill "$(cat shortener.pid)" 2>/dev/null || true
+
+  k6:
+    name: load test runs and the cache is exercised
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go build -o shortener ./cmd/shortener
+
+      - uses: grafana/setup-k6-action@v1
+
+      - name: Start the service
+        env:
+          SHORTENER_TOKEN: dev-token-at-least-16ch
+          SHORTENER_SLUG_SECRET: ci-slug-secret
+        run: |
+          ./shortener -addr :8080 &
+          echo $! > shortener.pid
+          for i in $(seq 1 30); do
+            curl -fsS localhost:8080/healthz >/dev/null 2>&1 && break
+            sleep 1
+          done
+
+      # A short run: the point is that the script is valid and the thresholds
+      # are met, not to publish a throughput number from a shared runner.
+      - name: Smoke the load test
+        run: |
+          k6 run --quiet \
+            -e TOKEN=dev-token-at-least-16ch -e CORPUS=200 -e HOT=20 \
+            --stage 5s:200 --stage 10s:500 --stage 5s:0 \
+            k6/redirect.js
+
+      - name: The cache was actually exercised
+        run: |
+          ratio=$(curl -fsS localhost:8080/metrics | awk '/^shortener_cache_hit_ratio /{print $2}')
+          echo "cache hit ratio: $ratio"
+          # Below this and the latency figures measured the store, not the
+          # cache, which makes the whole test meaningless.
+          python3 -c "import sys; r=float('$ratio'); sys.exit(0 if r > 0.5 else 1)" \
+            || { echo "::error::hit ratio $ratio is too low; the test did not exercise the cache"; exit 1; }
+          coalesced=$(curl -fsS localhost:8080/metrics | awk '/^shortener_cache_coalesced_total /{print $2}')
+          echo "coalesced misses: $coalesced"
+
+      - name: Stop the service
+        if: always()
+        run: kill "$(cat shortener.pid)" 2>/dev/null || true
+
+  docker:
+    name: image builds
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: false
+          load: true
+          tags: url-shortener:ci
+      - run: docker run --rm url-shortener:ci -version
+
+  tidy:
+    name: go.mod is tidy
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25'
+          cache: true
+      - run: go mod tidy
+      - run: git diff --exit-code go.mod
